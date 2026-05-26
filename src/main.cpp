@@ -25,6 +25,17 @@
 // GPS object — Air530Z is not a pre-declared singleton; must be instantiated here.
 Air530ZClass GPS;
 
+// Debug prints: can be overridden via build flags (e.g. -DDEBUG=0 for production)
+#ifndef DEBUG
+#define DEBUG 1
+#endif
+#if DEBUG
+#define DBG_PRINT(...)        \
+    do { Serial.printf(__VA_ARGS__); } while (0)
+#else
+#define DBG_PRINT(...) do {} while (0)
+#endif
+
 // ─── Radio & Protocol Configuration ──────────────────────────────────────────
 
 #define RF_FREQUENCY          915000000UL  // Hz — adjust for your region/band plan
@@ -44,6 +55,26 @@ Air530ZClass GPS;
 #define SLEEP_INTERVAL_MS  300000UL   // 5-minute deep-sleep interval
 #define GPS_TIMEOUT_MS      60000UL   // hard timeout waiting for GPS fix
 #define TX_TIMEOUT_MS        5000UL   // radio TX watchdog (software)
+// Beacon interval while waiting for GPS fix
+#define BEACON_INTERVAL_MS   10000UL  // send a beacon every 10 seconds while acquiring
+
+// Button / long-press configuration
+// Optional: define BUTTON_PIN (e.g. via build flag `-DBUTTON_PIN=2`) to enable
+// the on-board button long-press handler. When undefined, button code is
+// omitted so the project builds without a board-specific pin mapping.
+// Use the board variant symbol for the user button. USER_KEY maps to the
+// on-board button in the CubeCell variant (e.g. P3_3). This avoids mismatches
+// between Arduino numeric pin assumptions and the variant mapping.
+#define BUTTON_PIN USER_KEY
+#if defined(BUTTON_PIN)
+#define BUTTON_AVAILABLE 1
+#else
+#define BUTTON_AVAILABLE 0
+#endif
+#define BUTTON_LONGPRESS_MS 3000UL
+// Sampler parameters for diagnostics
+#define SAMPLE_DURATION_MS 10000UL
+#define SAMPLE_INTERVAL_MS 100U
 
 // ─── MeshCore Wire-Format Constants ──────────────────────────────────────────
 //
@@ -112,6 +143,12 @@ struct __attribute__((packed)) MeshCoreFrame {
 // Compile-time size check: 2 + 8 + 8 + 1 + 1 + 4 + 4 + 2 = 30 bytes
 static_assert(sizeof(MeshCoreFrame) == 30, "MeshCoreFrame size mismatch — check struct padding");
 
+// Default sender ID — replace per-device with a unique 8-byte identifier.
+static const uint8_t SENDER_ID[8] = {
+    0x50, 0x45, 0x54, 0x00,   // 'P','E','T', unit-class marker
+    0x00, 0x00, 0x00, 0x01    // device instance — change per unit
+};
+
 // ─── Globals ──────────────────────────────────────────────────────────────────
 
 static RadioEvents_t    RadioEvents;         // must outlive Radio.Init() call
@@ -121,8 +158,8 @@ static volatile bool    wakeFlag  = false;   // set by sleep timer callback
 
 // ─── Radio Event Callbacks ────────────────────────────────────────────────────
 
-static void OnTxDone(void)    { txDone = true; }
-static void OnTxTimeout(void) { txDone = true; }  // treat as completion; don't stall
+static void OnTxDone(void)    { txDone = true; DBG_PRINT("TX Done\r\n"); }
+static void OnTxTimeout(void) { txDone = true; DBG_PRINT("TX Timeout\r\n"); }  // treat as completion; don't stall
 
 // Required stubs — the CubeCell Radio driver may invoke these even in TX-only mode.
 static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
@@ -165,9 +202,47 @@ static void goToSleep(uint32_t ms) {
     }
 }
 
+// Helper: send a MeshCoreFrame and wait for completion (process radio IRQs)
+static void sendMeshFrame(const MeshCoreFrame *frame) {
+    Radio.SetChannel(RF_FREQUENCY);
+    Radio.SetSyncWord(LORA_SYNC_WORD);
+    Radio.SetTxConfig(
+        MODEM_LORA,
+        TX_OUTPUT_POWER,
+        0,
+        LORA_BANDWIDTH,
+        LORA_SPREADING_FACTOR,
+        LORA_CODINGRATE,
+        LORA_PREAMBLE_LENGTH,
+        false,
+        true,
+        0,
+        0,
+        false,
+        3000);
+
+    txDone = false;
+    Radio.Send((uint8_t *)frame, sizeof(*frame));
+    uint32_t t0 = millis();
+    while (!txDone && (millis() - t0) < TX_TIMEOUT_MS) {
+        Radio.IrqProcess();
+    }
+}
+
 // ─── Arduino Setup ────────────────────────────────────────────────────────────
 
 void setup() {
+    #if DEBUG
+    Serial.begin(115200);
+    delay(50);
+    DBG_PRINT("Setup: Serial started\r\n");
+    #endif
+    // Configure on-board button input (active-low with internal pullup)
+#if BUTTON_AVAILABLE
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+#else
+    DBG_PRINT("Button feature disabled: define BUTTON_PIN to enable long-press advert\r\n");
+#endif
     RadioEvents.TxDone    = OnTxDone;
     RadioEvents.TxTimeout = OnTxTimeout;
     RadioEvents.RxDone    = OnRxDone;
@@ -175,20 +250,74 @@ void setup() {
     RadioEvents.RxError   = OnRxError;
     Radio.Init(&RadioEvents);
     Radio.Sleep();   // keep radio off until first TX; re-configured each cycle
+    DBG_PRINT("Setup: Radio initialized and put to sleep\r\n");
 }
 
 // ─── Main Power Loop ──────────────────────────────────────────────────────────
 
 void loop() {
+    // Production: on-board button long-press advert (active-low)
+#if BUTTON_AVAILABLE
+    if (digitalRead(BUTTON_PIN) == LOW) {
+        uint32_t t0 = millis();
+        DBG_PRINT("Button pressed, measuring hold time...\r\n");
+        while (digitalRead(BUTTON_PIN) == LOW) {
+            if ((millis() - t0) >= BUTTON_LONGPRESS_MS) {
+                uint32_t held = millis() - t0;
+                DBG_PRINT("Button held %lu ms -> sending flood advert\r\n", held);
+                MeshCoreFrame advert = {};
+                advert.mc_header = MC_HEADER_BYTE;
+                advert.path_len = 0x00;
+                memcpy(advert.sender_id, SENDER_ID, sizeof(advert.sender_id));
+                memset(advert.dest_id, 0xFF, sizeof(advert.dest_id));
+                advert.flags = 0x02; // advert flag (application-defined)
+                advert.hop_limit = 3;
+                advert.latitude = 0.0f;
+                advert.longitude = 0.0f;
+                advert.battery_mv = getBatteryVoltage();
+                sendMeshFrame(&advert);
+                // Wait for release to avoid re-trigger
+                while (digitalRead(BUTTON_PIN) == LOW) delay(10);
+                break;
+            }
+            delay(10);
+        }
+    }
+#endif
 
     // ── 1. Power on GPS and search for a 2D/3D fix ──────────────────────────
+    DBG_PRINT("Wake: powering GPS on and starting acquisition\r\n");
     vextOn();
     delay(100);     // allow Vext rail & Air530Z module to power up
     GPS.begin();
 
+    // Ensure radio is configured for beacons while acquiring GPS fix
+    Radio.SetChannel(RF_FREQUENCY);
+    Radio.SetSyncWord(LORA_SYNC_WORD);
+    Radio.SetTxConfig(
+        MODEM_LORA,
+        TX_OUTPUT_POWER,
+        0,
+        LORA_BANDWIDTH,
+        LORA_SPREADING_FACTOR,
+        LORA_CODINGRATE,
+        LORA_PREAMBLE_LENGTH,
+        false,
+        true,
+        0,
+        0,
+        false,
+        3000);
+
     bool    fixAcquired = false;
     float   lat = 0.0f, lon = 0.0f;
     uint32_t gpsStart = millis();
+    uint32_t nextBeacon = gpsStart; // send immediately on wake
+    // Button press tracking during GPS acquisition (allows long-press while waiting)
+#if BUTTON_AVAILABLE
+    uint32_t btnPressStart = 0;
+    bool btnAdvertSent = false;
+#endif
 
     while ((millis() - gpsStart) < GPS_TIMEOUT_MS) {
         while (GPS.available() > 0) {
@@ -200,10 +329,54 @@ void loop() {
             fixAcquired = true;
             break;
         }
+
+        // Allow the user button to trigger a flood advert while waiting for GPS
+        // This makes the device responsive during the acquisition window.
+#if BUTTON_AVAILABLE
+        int btnState = digitalRead(BUTTON_PIN);
+        if (btnState == LOW) {
+            if (btnPressStart == 0) btnPressStart = millis();
+            else if (!btnAdvertSent && (millis() - btnPressStart) >= BUTTON_LONGPRESS_MS) {
+                DBG_PRINT("Long-press detected during GPS acquisition -> sending flood advert\r\n");
+                MeshCoreFrame advert = {};
+                advert.mc_header = MC_HEADER_BYTE;
+                advert.path_len = 0x00;
+                memcpy(advert.sender_id, SENDER_ID, sizeof(advert.sender_id));
+                memset(advert.dest_id, 0xFF, sizeof(advert.dest_id));
+                advert.flags = 0x02; // advert flag (application-defined)
+                advert.hop_limit = 3;
+                advert.latitude = 0.0f;
+                advert.longitude = 0.0f;
+                advert.battery_mv = getBatteryVoltage();
+                sendMeshFrame(&advert);
+                btnAdvertSent = true;
+            }
+        } else {
+            btnPressStart = 0;
+        }
+#endif
+
+        // While waiting for fix, periodically send a lightweight beacon
+        if (millis() >= nextBeacon) {
+            MeshCoreFrame beacon = {};
+            beacon.mc_header = MC_HEADER_BYTE;
+            beacon.path_len = 0x00;
+            memcpy(beacon.sender_id, SENDER_ID, sizeof(beacon.sender_id));
+            memset(beacon.dest_id, 0xFF, sizeof(beacon.dest_id));
+            beacon.flags = 0x01; // indicate no-fix (application-defined)
+            beacon.hop_limit = 3;
+            beacon.latitude = 0.0f;
+            beacon.longitude = 0.0f;
+            beacon.battery_mv = getBatteryVoltage();
+            DBG_PRINT("Beacon (no-fix): batt=%u mV\r\n", beacon.battery_mv);
+            sendMeshFrame(&beacon);
+            nextBeacon = millis() + BEACON_INTERVAL_MS;
+        }
     }
 
     // ── 2. No fix within timeout: conserve battery, sleep immediately ────────
     if (!fixAcquired) {
+        DBG_PRINT("No GPS fix within %lu ms — sleeping\r\n", GPS_TIMEOUT_MS);
         GPS.end();
         vextOff();
         goToSleep(SLEEP_INTERVAL_MS);
@@ -214,6 +387,7 @@ void loop() {
     // getBatteryVoltage() handles VBAT_ADC_CTL pin setup/teardown internally
     // for CubeCell_GPS boards, averages 50 ADC reads, and returns millivolts.
     uint16_t battMv = getBatteryVoltage();
+    DBG_PRINT("GPS fix: lat=%f lon=%f, battery=%u mV\r\n", lat, lon, battMv);
 
     // ── 4. Build MeshCore RAW_CUSTOM flood frame ─────────────────────────────
     MeshCoreFrame frame = {};
@@ -221,13 +395,7 @@ void loop() {
     frame.mc_header = MC_HEADER_BYTE;
     frame.path_len  = 0x00;
 
-    // Replace SENDER_ID with a stable 8-byte unique identifier for this unit.
-    // e.g. derive from a device serial number, a fixed factory-programmed value,
-    // or a unique constant per tracker. All zeros is a valid placeholder for testing.
-    static const uint8_t SENDER_ID[8] = {
-        0x50, 0x45, 0x54, 0x00,   // 'P','E','T', unit-class marker
-        0x00, 0x00, 0x00, 0x01    // device instance — change per unit
-    };
+    // frame.sender_id is populated from the global SENDER_ID defined above.
     memcpy(frame.sender_id, SENDER_ID, sizeof(SENDER_ID));
 
     memset(frame.dest_id, 0xFF, sizeof(frame.dest_id));   // broadcast
@@ -260,6 +428,7 @@ void loop() {
         3000                     // internal TX timeout (ms)
     );
 
+    DBG_PRINT("Transmitting frame (%u bytes)\r\n", (unsigned)sizeof(frame));
     txDone = false;
     Radio.Send((uint8_t *)&frame, sizeof(frame));
 
@@ -273,8 +442,10 @@ void loop() {
 
     // ── 6. Power down everything and return to deep sleep ────────────────────
     Radio.Sleep();
+    DBG_PRINT("Radio put to sleep\r\n");
     GPS.end();
     vextOff();
+    DBG_PRINT("Entering deep sleep for %lu ms\r\n", SLEEP_INTERVAL_MS);
     goToSleep(SLEEP_INTERVAL_MS);
     // loop() called again after wakeup — returns to step 1
 }
